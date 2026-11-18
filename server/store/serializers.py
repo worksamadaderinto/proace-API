@@ -1,0 +1,965 @@
+from uuid import uuid4
+from payment.fulfillment import TRANSITIONS as FULFILLMENT_TRANSITIONS
+from core.listing_filters import ListingQuerySerializer
+from core.fields import ValidatedJSONField
+from utils.timezones import DashboardPeriodField, TimeZoneField
+import json
+import urllib.parse
+from decimal import Decimal
+from typing import Any
+
+from django.db import transaction
+from django.utils import timezone
+from django.conf import settings
+from django.core.files.uploadedfile import UploadedFile
+from rest_framework import serializers
+from taggit.serializers import TaggitSerializer, TagListSerializerField
+
+from product.models import Product, ProductImg, Specification
+from store.models import (
+    MerchantWallet, Schedule, Store, StoreAddress, StoreEarningsLedger,
+    StoreImg, StoreInfo, StorePayout, StoreTeamMember,
+)
+
+
+from store.services import calculate_store_tier
+from utils.functions import normalize_media_url
+from utils.digital_previews import (
+    is_image_digital_asset, digital_asset_kind, allowed_variant_asset_types,
+    DIGITAL_VARIANT_ASSET_TYPES, MAX_DIGITAL_FILE_BYTES,
+)
+from utils.image_uploads import ImageUploadError, normalize_public_image
+
+
+class StoreSerializer(serializers.ModelSerializer):
+    product_upload_limit_bytes = serializers.SerializerMethodField()
+    resumable_upload_limit_bytes = serializers.SerializerMethodField()
+    digital_variant_policy = serializers.SerializerMethodField()
+
+    def get_resumable_upload_limit_bytes(self, obj: Store) -> int:
+        from store.transfers import maximum_bytes
+        return maximum_bytes()
+
+    def get_product_upload_limit_bytes(self, obj: Store) -> int:
+        return MAX_DIGITAL_FILE_BYTES
+
+    def get_digital_variant_policy(self, obj: Store) -> dict[str, list[str]]:
+        return {kind: list(options) for kind, options in DIGITAL_VARIANT_ASSET_TYPES.items()}
+
+    seller_tier = serializers.SerializerMethodField()
+    user_role = serializers.SerializerMethodField()
+    owner_name = serializers.SerializerMethodField()
+    owner_email = serializers.EmailField(source='user.email', read_only=True)
+    owner_avatar_url = serializers.CharField(source='user.avatar_url', read_only=True, default='')
+
+    class Meta:
+        model = Store
+        fields = [
+            'id', 'user', 'username', 'name', 'status', 'is_official', 'is_partner', 'seller_tier', 'user_role', 'assigned_staff', 'digital_variant_policy', 'product_upload_limit_bytes', 'resumable_upload_limit_bytes',
+            'owner_name', 'owner_email', 'owner_avatar_url',
+            'blocked_reason', 'blocked_at', 'blocked_by', 'verified_at', 'verified_by',
+            'created', 'updated', 'last_active_at',
+        ]
+        read_only_fields = [
+            'id', 'user', 'status', 'is_official', 'is_partner', 'seller_tier', 'user_role', 'assigned_staff',
+            'owner_name', 'owner_email', 'owner_avatar_url',
+            'blocked_reason', 'blocked_at', 'blocked_by', 'verified_at', 'verified_by',
+            'created', 'updated', 'last_active_at',
+        ]
+        extra_kwargs = {'username': {'required': False}}
+
+    def get_seller_tier(self, obj):
+        tiers = self.context.setdefault('store_seller_tiers', {})
+        if not tiers and isinstance(self.parent, serializers.ListSerializer):
+            from store.services import batch_store_tiers
+            tiers.update(batch_store_tiers(self.parent.instance))
+        if obj.pk not in tiers:
+            from store.services import calculate_store_tier
+            tiers[obj.pk] = calculate_store_tier(obj)
+        return tiers[obj.pk]
+
+    def get_owner_name(self, obj: Store) -> str:
+        if not obj.user:
+            return ''
+        full_name = f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip()
+        return full_name or (obj.user.email.split('@')[0] if obj.user.email else '')
+
+    def get_user_role(self, obj: Store) -> str:
+        request = self.context.get('request')
+        if not request or not getattr(request, 'user', None) or not request.user.is_authenticated:
+            return ''
+        roles = self.context.setdefault('store_user_roles', {})
+        if not roles and isinstance(self.parent, serializers.ListSerializer):
+            from store.services import batch_store_user_roles
+            roles.update(batch_store_user_roles(self.parent.instance, request.user))
+        if obj.pk not in roles:
+            from store.services import get_store_user_role
+            roles[obj.pk] = get_store_user_role(obj, request.user) or ''
+        return roles[obj.pk]
+
+
+class StoreTeamMemberSerializer(serializers.ModelSerializer):
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    email = serializers.SerializerMethodField()
+    first_name = serializers.SerializerMethodField()
+    last_name = serializers.SerializerMethodField()
+    avatar_url = serializers.SerializerMethodField()
+    role_display = serializers.CharField(source='get_role_display', read_only=True)
+    invited_by_email = serializers.EmailField(source='invited_by.email', read_only=True)
+    status = serializers.CharField(read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = StoreTeamMember
+        fields = [
+            'id', 'user_id', 'email', 'first_name', 'last_name', 'avatar_url',
+            'role', 'role_display', 'status', 'status_display', 'invited_by_email', 'created', 'updated',
+        ]
+        read_only_fields = [
+            'id', 'user_id', 'email', 'first_name', 'last_name', 'avatar_url',
+            'role_display', 'status', 'status_display', 'invited_by_email', 'created', 'updated',
+        ]
+
+    def get_email(self, obj: StoreTeamMember) -> str:
+        if obj.user and getattr(obj.user, 'email', None):
+            return obj.user.email
+        return obj.invited_email or ''
+
+    def get_first_name(self, obj: StoreTeamMember) -> str:
+        if obj.user:
+            return getattr(obj.user, 'first_name', '') or ''
+        return ''
+
+    def get_last_name(self, obj: StoreTeamMember) -> str:
+        if obj.user:
+            return getattr(obj.user, 'last_name', '') or ''
+        return ''
+
+    def get_avatar_url(self, obj: StoreTeamMember) -> str:
+        if not obj.user:
+            return ''
+        avatar = getattr(obj.user, 'avatar_url', None)
+        if isinstance(avatar, str) and avatar:
+            return avatar
+        avatar_image = getattr(obj.user, 'avatar_image', None)
+        if avatar_image and hasattr(avatar_image, 'url'):
+            return normalize_media_url(avatar_image.url)
+        return ''
+
+
+class StoreTeamMemberInviteSerializer(serializers.Serializer):
+    email = serializers.EmailField(required=True)
+    role = serializers.ChoiceField(
+        choices=StoreTeamMember.ROLE_CHOICES,
+        default=StoreTeamMember.ROLE_CATALOG_MANAGER,
+    )
+
+
+class StoreTeamMemberUpdateSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=StoreTeamMember.ROLE_CHOICES, required=True)
+
+
+class StoreInfoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StoreInfo
+        fields = ['email', 'bio', 'announcement', 'pinned_products', 'avatar_url', 'banner_url', 'website',
+                  'instagram', 'twitter', 'facebook',
+                  'whatsapp', 'phone1', 'phone2']
+        extra_kwargs = {field: {'required': False, 'allow_blank': True}
+                        for field in ['bio', 'announcement', 'avatar_url', 'banner_url', 'website',
+                                      'instagram', 'twitter', 'facebook']}
+
+    def validate_pinned_products(self, value: Any) -> list[int]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError('Pinned products must be a list of product IDs.')
+        cleaned_ids: list[int] = []
+        for item in value:
+            try:
+                pid = int(item)
+                if pid <= 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(f'Invalid product ID: {item}')
+            if pid not in cleaned_ids:
+                cleaned_ids.append(pid)
+
+        if len(cleaned_ids) > 3:
+            raise serializers.ValidationError('You can pin at most 3 products on your store page.')
+
+        store = None
+        if self.instance and getattr(self.instance, 'store', None):
+            store = self.instance.store
+        elif 'store' in self.context:
+            store = self.context['store']
+
+        if store and cleaned_ids:
+            found_count = Product.objects.filter(store=store, pk__in=cleaned_ids).count()
+            if found_count != len(cleaned_ids):
+                raise serializers.ValidationError('All pinned products must belong to this store.')
+
+        return cleaned_ids
+
+    def to_representation(self, instance: StoreInfo) -> dict[str, Any]:
+        data = super().to_representation(instance)
+        for kind in ('avatar', 'banner'):
+            image = getattr(instance, f'{kind}_image')
+            if image:
+                data[f'{kind}_url'] = (
+                    f'/api/stores/{instance.store_id}/public/images/{kind}'
+                    f'?v={instance.updated.strftime("%Y%m%d%H%M%S%f")}'
+                )
+        return data
+
+
+class StoreBrandingImageSerializer(serializers.Serializer):
+    image = serializers.ImageField(allow_empty_file=False)
+
+    def validate_image(self, value: UploadedFile) -> UploadedFile:
+        dimensions = (512, 512) if self.context['kind'] == 'avatar' else (1600, 600)
+        try:
+            return normalize_public_image(value, expected_size=dimensions)
+        except ImageUploadError as error:
+            raise serializers.ValidationError(str(error)) from error
+
+
+class StoreAddressSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StoreAddress
+        fields = ['id', 'store', 'address', 'zip', 'country', 'state', 'city',
+                  'is_default', 'created', 'updated']
+        read_only_fields = ['id', 'store', 'created', 'updated']
+        extra_kwargs = {'is_default': {'default': True}, **{field: {'required': True, 'allow_blank': False, 'allow_null': False} for field in ('address', 'city', 'state', 'country', 'zip')}}
+
+
+class StoreSettingsRequestSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=Store._meta.get_field('name').max_length)
+    profile = StoreInfoSerializer()
+    address = StoreAddressSerializer()
+
+
+class StoreSettingsResponseSerializer(serializers.Serializer):
+    store = StoreSerializer()
+    profile = StoreInfoSerializer()
+    address = StoreAddressSerializer()
+
+
+class StoreOnboardingSerializer(StoreSerializer):
+    profile = StoreInfoSerializer(required=False, write_only=True)
+    address = StoreAddressSerializer(required=True, write_only=True)
+
+    class Meta(StoreSerializer.Meta):
+        fields = StoreSerializer.Meta.fields + ['profile', 'address']
+
+    @transaction.atomic
+    def create(self, validated_data):
+        profile = validated_data.pop('profile', None)
+        address = validated_data.pop('address', None)
+        store = super().create(validated_data)
+        if profile is not None:
+            StoreInfo.objects.create(store=store, **profile)
+        if address is not None:
+            StoreAddress.objects.create(store=store, **address)
+        return store
+
+
+class MerchantImageSerializer(serializers.ModelSerializer):
+    image = serializers.ImageField(allow_empty_file=False)
+
+    class Meta:
+        model = ProductImg
+        fields = ['id', 'image']
+
+    def validate_image(self, value: UploadedFile) -> UploadedFile:
+        try:
+            return normalize_public_image(value)
+        except ImageUploadError as error:
+            raise serializers.ValidationError(str(error)) from error
+
+    def to_representation(self, instance: ProductImg) -> dict[str, Any]:
+        data = super().to_representation(instance)
+        if data.get('image'):
+            data['image'] = normalize_media_url(data['image'])
+        return data
+
+
+class MerchantSpecificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Specification
+        exclude = ['product']
+        read_only_fields = ['id', 'created', 'updated']
+        extra_kwargs = {field: {'min_value': Decimal('0.01')}
+                        for field in ['height', 'width', 'breadth', 'weight']}
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        product = self.context.get('product') or getattr(self.instance, 'product', None)
+        if product and (product.is_digital or product.product_type == Product.PRODUCT_TYPE_AFFILIATE_CLICKBANK):
+            raise serializers.ValidationError('Digital and affiliate partner products cannot have physical specifications.')
+        return attrs
+
+
+class MerchantVariantUploadSerializer(serializers.Serializer):
+    index = serializers.IntegerField(min_value=0, max_value=99)
+    file = serializers.FileField(allow_empty_file=False)
+
+    def validate_file(self, value: UploadedFile) -> UploadedFile:
+        if value.size > MAX_DIGITAL_FILE_BYTES:
+            raise serializers.ValidationError('Variant files must be 50 MB or smaller.')
+        return value
+
+
+class MerchantProductSerializer(TaggitSerializer, serializers.ModelSerializer):
+    variant_uploads = MerchantVariantUploadSerializer(many=True, write_only=True, required=False, max_length=100)
+    resumable_draft = serializers.BooleanField(write_only=True, required=False, default=False)
+    def validate_informational_video(self, value: UploadedFile | None) -> UploadedFile | None:
+        if value is None:
+            return None
+        header = value.read(12)
+        value.seek(0)
+        if (
+            value.size > 4 * 1024 * 1024
+            or not value.name.lower().endswith('.mp4')
+            or len(header) < 12
+            or header[4:8] != b'ftyp'
+            or header[8:12] == b'qt  '
+        ):
+            raise serializers.ValidationError('Choose an MP4 video of 4 MB or less.')
+        # Avoid preserving a user supplied filename in public storage.
+        value.name = f'{uuid4().hex}.mp4'
+        value.content_type = 'video/mp4'
+        return value
+
+    digital_file = serializers.FileField(required=False, write_only=True, allow_empty_file=False)
+    allowed_variant_asset_types = serializers.SerializerMethodField()
+    cover_image = serializers.ImageField(required=False, write_only=True, allow_empty_file=False)
+    image_url = serializers.CharField(required=False, allow_blank=True, max_length=1000)
+    tags = TagListSerializerField(required=False)
+    images = MerchantImageSerializer(many=True, read_only=True)
+    specifications = MerchantSpecificationSerializer(source='specification', read_only=True)
+    sale_price = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
+    is_upcoming_drop = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Product
+        fields = ['id', 'store', 'title', 'description', 'category', 'price', 'brand', 'image_url', 'cover_image', 'digital_file', 'informational_video', 'resumable_draft', 'allowed_variant_asset_types', 'variant_uploads',
+                  'discount', 'base_discount', 'sale_price', 'available', 'visibility', 'label',
+                  'is_blocked', 'blocked_reason', 'blocked_at',
+                  'tags', 'images', 'specifications', 'sales', 'flash_sale_end', 'drop_at', 'is_upcoming_drop', 'variants', 'average_rating',
+                  'sponsored', 'weight', 'length', 'width', 'height', 'is_digital', 'digital_file_url', 'digital_preview_watermark', 'preview_status', 'preview_error',
+                  'product_type', 'affiliate_hoplink', 'affiliate_vendor_nickname', 'affiliate_button_text', 'created', 'updated']
+        read_only_fields = ['label', 'is_blocked', 'blocked_reason', 'blocked_at', 'id', 'store', 'sales', 'average_rating', 'sponsored',
+                            'is_upcoming_drop', 'preview_status', 'preview_error', 'created', 'updated']
+        extra_kwargs = {
+            'price': {'min_value': Decimal('0.00'), 'required': False},
+            'discount': {'default': 0},
+            'base_discount': {'default': 0, 'required': False},
+            'available': {'default': 0},
+            'visibility': {'default': False},
+            'weight': {'min_value': Decimal('0.00'), 'default': Decimal('1.00')},
+            'length': {'min_value': Decimal('0.01')}, 'width': {'min_value': Decimal('0.01')}, 'height': {'min_value': Decimal('0.01')},
+        }
+
+    def get_allowed_variant_asset_types(self, obj: Product) -> list[str]:
+        return list(allowed_variant_asset_types(obj.digital_file_url)) if obj.is_digital else []
+
+    def validate_digital_file(self, value: UploadedFile) -> UploadedFile:
+        if value.size > MAX_DIGITAL_FILE_BYTES:
+            raise serializers.ValidationError('Digital files must be 50 MB or smaller.')
+        return value
+
+    def save_digital_file(self, product: Product, upload: UploadedFile | None, create_cover: bool = False) -> Product:
+        if upload is None:
+            return product
+        from django.core.files.storage import default_storage
+        import logging
+        try:
+            product.digital_file_url = default_storage.save(
+                f'digital_products/{product.store_id}/{product.pk}/{uuid4().hex}_{upload.name}', upload,
+            )
+            if create_cover and is_image_digital_asset(upload.name):
+                from utils.digital_previews import create_digital_preview
+                preview = create_digital_preview(upload, product.store_id, product.pk)
+                if not preview:
+                    raise serializers.ValidationError({'cover_image': 'Upload a separate product cover; a preview could not be generated from this content.'})
+                ProductImg.objects.create(product=product, image=preview)
+                product.image_url = normalize_media_url(default_storage.url(preview))
+                product.digital_preview_watermark = True
+            product.save(update_fields=['digital_file_url', 'image_url', 'digital_preview_watermark', 'updated'])
+        except serializers.ValidationError:
+            raise
+        except Exception as error:
+            logging.getLogger(__name__).exception('Product digital upload failed for product %s', product.pk)
+            raise serializers.ValidationError({'digital_file': 'Unable to store this digital file. Please try again.'}) from error
+        return product
+
+    def save_variant_uploads(self, product: Product, uploads: list[dict[str, Any]]) -> None:
+        if not uploads:
+            return
+        from django.core.files.storage import default_storage
+        from utils.digital_previews import create_digital_preview
+        import logging
+        variants = [dict(row) for row in product.variants]
+        try:
+            for row in uploads:
+                upload = row['file']
+                option = variants[row['index']]
+                option['digital_file_type'] = digital_asset_kind(upload.name)
+                option['digital_file_url'] = default_storage.save(
+                    f'digital_products/{product.store_id}/{product.pk}/variants/{uuid4().hex}_{upload.name}', upload,
+                )
+                if is_image_digital_asset(upload.name):
+                    preview = create_digital_preview(upload, product.store_id, product.pk)
+                    if not preview:
+                        raise serializers.ValidationError({'variant_uploads': 'Unable to create a protected preview for this variant image.'})
+                    option['image_url'] = normalize_media_url(default_storage.url(preview))
+            product.variants = variants
+            product.save(update_fields=['variants', 'updated'])
+        except serializers.ValidationError:
+            raise
+        except Exception as error:
+            logging.getLogger(__name__).exception('Product variant upload failed for product %s', product.pk)
+            raise serializers.ValidationError({'variant_uploads': 'Unable to store variant content. Please try again.'}) from error
+
+    def validate_cover_image(self, value: UploadedFile) -> UploadedFile:
+        try:
+            return normalize_public_image(value)
+        except ImageUploadError as error:
+            raise serializers.ValidationError(str(error)) from error
+
+    @transaction.atomic
+    def create(self, validated_data: dict[str, Any]) -> Product:
+        cover = validated_data.pop('cover_image', None)
+        digital = validated_data.pop('digital_file', None)
+        uploads = validated_data.pop('variant_uploads', [])
+        product = super().create(validated_data)
+        self.save_digital_file(product, digital, create_cover=cover is None and not product.image_url)
+        self.save_variant_uploads(product, uploads)
+        if cover is not None:
+            image = ProductImg.objects.create(product=product, image=cover)
+            product.image_url = normalize_media_url(image.image.url)
+            product.save(update_fields=['image_url', 'updated'])
+        return product
+
+    @transaction.atomic
+    def update(self, instance: Product, validated_data: dict[str, Any]) -> Product:
+        cover = validated_data.pop('cover_image', None)
+        digital = validated_data.pop('digital_file', None)
+        uploads = validated_data.pop('variant_uploads', [])
+        product = super().update(instance, validated_data)
+        self.save_digital_file(product, digital, create_cover=cover is None and not product.image_url)
+        self.save_variant_uploads(product, uploads)
+        if cover is not None:
+            image = ProductImg.objects.create(product=product, image=cover)
+            product.image_url = normalize_media_url(image.image.url)
+            product.save(update_fields=['image_url', 'updated'])
+        return product
+
+    def validate_visibility(self, value: bool) -> bool:
+        if value and self.instance and self.instance.is_blocked and not self.instance.visibility:
+            raise serializers.ValidationError('This product is blocked by the platform. Only staff can restore it.')
+        return value
+
+    def validate_variants(self, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or len(value) > 100:
+            raise serializers.ValidationError('Use at most 100 variants per product.')
+        if len(json.dumps(value)) > 65536:
+            raise serializers.ValidationError('Variant data must be at most 64 KB.')
+        names: set[str] = set()
+        for row in value:
+            if not isinstance(row, dict) or not isinstance(row.get('name'), str) or not row['name'].strip() or len(row['name']) > 80:
+                raise serializers.ValidationError('Each variant needs a name of 1–80 characters.')
+            if row['name'] in names:
+                raise serializers.ValidationError('Variant names must be unique.')
+            names.add(row['name'])
+            if 'available' in row:
+                row['available'] = serializers.IntegerField(min_value=0, max_value=1000000).run_validation(row['available'])
+            row['price_delta'] = str(serializers.DecimalField(max_digits=12, decimal_places=2).run_validation(row.get('price_delta') or '0'))
+            if 'digital_file_type' in row:
+                row['digital_file_type'] = serializers.ChoiceField(
+                    choices=['image', 'audio', 'video', 'document'],
+                ).run_validation(row['digital_file_type'])
+            digital_file_url = row.get('digital_file_url', '')
+            if not isinstance(digital_file_url, str):
+                raise serializers.ValidationError('Digital asset addresses must be strings.')
+            if digital_file_url:
+                try:
+                    path = urllib.parse.urlsplit(digital_file_url).path.lstrip('/')
+                except (TypeError, ValueError) as error:
+                    raise serializers.ValidationError('Choose a digital asset uploaded for this product.') from error
+                for prefix in (f'{settings.MINIO_BUCKET_NAME}/media/', f'{settings.MINIO_BUCKET_NAME}/', 'media/'):
+                    if path.startswith(prefix):
+                        path = path[len(prefix):]
+                        break
+                expected = (
+                    f'digital_products/{self.instance.store_id}/{self.instance.pk}/variants/'
+                    if self.instance is not None else None
+                )
+                if (
+                    expected is None
+                    or '..' in path.split('/')
+                    or not path.startswith(expected)
+                ):
+                    raise serializers.ValidationError('Choose a digital asset uploaded for this product.')
+        return value
+
+    def validate_image_url(self, value: str) -> str:
+        # Storage-generated URLs may use local hostnames that URLField rejects.
+        if self.instance is not None and value == self.instance.image_url:
+            return value
+        return serializers.URLField(allow_blank=True, max_length=1000).run_validation(value)
+
+    def to_representation(self, instance: Product) -> dict[str, Any]:
+        data = super().to_representation(instance)
+        if data.get('image_url'):
+            data['image_url'] = normalize_media_url(data['image_url'])
+        return data
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        resumable_draft = attrs.pop("resumable_draft", False)
+        upload_bytes = sum(file.size for file in (attrs.get('cover_image'), attrs.get('digital_file')) if file)
+        upload_bytes += sum(row['file'].size for row in attrs.get('variant_uploads', []))
+        if upload_bytes > MAX_DIGITAL_FILE_BYTES:
+            raise serializers.ValidationError({'digital_file': 'Combined product uploads must be 50 MB or smaller.'})
+        # Enforce before provider-specific early returns and automatic digital covers.
+        image_url = attrs.get('image_url', getattr(self.instance, 'image_url', ''))
+        has_gallery = self.instance is not None and self.instance.images.exclude(image='').exists()
+        checks_image = self.instance is None or 'image_url' in attrs or attrs.get('visibility') is True
+        uploaded_artwork = attrs.get('digital_file')
+        can_generate_cover = bool(uploaded_artwork and attrs.get('is_digital', getattr(self.instance, 'is_digital', False)) and is_image_digital_asset(uploaded_artwork.name))
+        if checks_image and not attrs.get('cover_image') and not image_url and not has_gallery and not can_generate_cover:
+            raise serializers.ValidationError({
+                'image_url': 'Add at least one product image before saving. Upload a cover image or provide a valid image URL.'
+            })
+        product_type = attrs.get('product_type', getattr(self.instance, 'product_type', Product.PRODUCT_TYPE_STANDARD))
+        if (attrs.get('digital_file') or attrs.get('variant_uploads')) and (product_type != Product.PRODUCT_TYPE_STANDARD or not attrs.get('is_digital', getattr(self.instance, 'is_digital', False))):
+            raise serializers.ValidationError({'digital_file': 'Digital content can only be uploaded for a digital product.'})
+
+        if product_type == Product.PRODUCT_TYPE_AFFILIATE_CLICKBANK:
+            hoplink = attrs.get('affiliate_hoplink', getattr(self.instance, 'affiliate_hoplink', '') or '').strip()
+            if not hoplink:
+                raise serializers.ValidationError({
+                    'affiliate_hoplink': 'An affiliate HopLink URL is required for ClickBank partner products.'
+                })
+            split_url = urllib.parse.urlsplit(hoplink)
+            if split_url.scheme not in ('http', 'https') or not split_url.netloc:
+                raise serializers.ValidationError({
+                    'affiliate_hoplink': 'Provide a valid web address starting with http:// or https://.'
+                })
+            if attrs.get('discount') and int(attrs['discount']) > 0:
+                raise serializers.ValidationError({
+                    'discount': 'ClickBank affiliate partner offers cannot have platform discounts. All promotional pricing and discounts are controlled externally by the partner vendor.'
+                })
+            if attrs.get('flash_sale_end'):
+                raise serializers.ValidationError({
+                    'flash_sale_end': 'Flash deals cannot be scheduled for ClickBank affiliate partner offers.'
+                })
+            if attrs.get('drop_at'):
+                raise serializers.ValidationError({
+                    'drop_at': 'Scheduled drops cannot be configured for ClickBank affiliate partner offers.'
+                })
+            attrs['product_type'] = Product.PRODUCT_TYPE_AFFILIATE_CLICKBANK
+            attrs['affiliate_hoplink'] = hoplink
+            if 'price' not in attrs or attrs['price'] is None:
+                attrs['price'] = getattr(self.instance, 'price', None) or Decimal('0.00')
+            attrs['discount'] = 0
+            attrs['base_discount'] = 0
+            attrs['flash_sale_end'] = None
+            attrs['drop_at'] = None
+            attrs['is_digital'] = False
+            attrs['digital_file_url'] = ''
+            attrs['variants'] = []
+            attrs['weight'] = Decimal('0.00')
+            attrs['length'] = None
+            attrs['width'] = None
+            attrs['height'] = None
+            if not attrs.get('available') and not getattr(self.instance, 'available', None):
+                attrs['available'] = 999
+            return attrs
+
+        drop_at = attrs.get('drop_at')
+        if drop_at and drop_at <= timezone.now():
+            if drop_at != getattr(self.instance, 'drop_at', None):
+                raise serializers.ValidationError({'drop_at': 'Choose a future scheduled release date and time.'})
+            attrs.pop('drop_at')
+
+        flash_sale_end = attrs.get('flash_sale_end', getattr(self.instance, 'flash_sale_end', None))
+        if flash_sale_end:
+            if flash_sale_end <= timezone.now():
+                if flash_sale_end != getattr(self.instance, 'flash_sale_end', None):
+                    raise serializers.ValidationError({'flash_sale_end': 'Choose a future flash deal expiration date and time.'})
+                attrs.pop('flash_sale_end', None)
+                flash_sale_end = None
+
+        has_base_in_input = hasattr(self, 'initial_data') and isinstance(self.initial_data, dict) and 'base_discount' in self.initial_data
+        has_disc_in_input = hasattr(self, 'initial_data') and isinstance(self.initial_data, dict) and 'discount' in self.initial_data
+
+        discount = attrs.get('discount', getattr(self.instance, 'discount', 0))
+        base_discount = attrs.get('base_discount', getattr(self.instance, 'base_discount', 0))
+
+        if flash_sale_end:
+            if not has_base_in_input:
+                base_discount = getattr(self.instance, 'base_discount', 0)
+            if discount <= base_discount:
+                raise serializers.ValidationError({
+                    'discount': f'Flash deal discount ({discount}%) must be greater than regular discount ({base_discount}%).'
+                })
+            attrs['base_discount'] = base_discount
+            attrs['discount'] = discount
+        else:
+            if has_disc_in_input and not has_base_in_input:
+                attrs['base_discount'] = attrs['discount']
+            elif has_base_in_input and not has_disc_in_input:
+                attrs['discount'] = base_discount
+                attrs['base_discount'] = base_discount
+            elif has_disc_in_input and has_base_in_input:
+                attrs['discount'] = base_discount
+                attrs['base_discount'] = base_discount
+            else:
+                current_base = getattr(self.instance, 'base_discount', getattr(self.instance, 'discount', 0))
+                attrs['discount'] = current_base
+                attrs['base_discount'] = current_base
+            attrs['flash_sale_end'] = None
+
+        standard_price = attrs.get('price', getattr(self.instance, 'price', None))
+        if standard_price is None or Decimal(str(standard_price)) < Decimal('0.01'):
+            raise serializers.ValidationError({'price': 'Ensure this value is greater than or equal to 0.01.'})
+
+        is_digital = attrs.get('is_digital', getattr(self.instance, 'is_digital', False))
+        file_url = attrs.get('digital_file_url', getattr(self.instance, 'digital_file_url', ''))
+        uploads = attrs.get('variant_uploads', [])
+        if uploads:
+            if not is_digital:
+                raise serializers.ValidationError({'variant_uploads': 'Variant content requires a digital product.'})
+            base_name = attrs['digital_file'].name if attrs.get('digital_file') else file_url
+            allowed_types = allowed_variant_asset_types(base_name)
+            variants = [dict(option) for option in attrs.get('variants', getattr(self.instance, 'variants', []))]
+            attrs['variants'] = variants
+            seen: set[int] = set()
+            for row in uploads:
+                index = row['index']
+                if index in seen or index >= len(variants):
+                    raise serializers.ValidationError({'variant_uploads': 'Choose a unique existing option for each uploaded file.'})
+                seen.add(index)
+                kind = digital_asset_kind(row['file'].name)
+                if kind not in allowed_types:
+                    raise serializers.ValidationError({'variant_uploads': 'Variant content must be compatible with the main digital file.'})
+                if variants[index].get('digital_file_type') and variants[index]['digital_file_type'] != kind:
+                    raise serializers.ValidationError({'variant_uploads': 'The uploaded file must match the selected variant type.'})
+                variants[index].pop('digital_file_url', None)
+                variants[index]['digital_file_type'] = kind
+
+        if is_digital:
+            if 'digital_file_url' in attrs and file_url != getattr(self.instance, 'digital_file_url', ''):
+                try:
+                    path = urllib.parse.urlsplit(file_url).path.lstrip('/')
+                except ValueError:
+                    raise serializers.ValidationError({'digital_file_url': 'Enter a valid digital asset address.'})
+                for prefix in (f'{settings.MINIO_BUCKET_NAME}/media/', f'{settings.MINIO_BUCKET_NAME}/', 'media/'):
+                    if path.startswith(prefix):
+                        path = path[len(prefix):]
+                        break
+                if '..' in path.split('/'):
+                    raise serializers.ValidationError({'digital_file_url': 'Choose a digital asset uploaded for this product.'})
+                if path.startswith('digital_products/'):
+                    expected = f'digital_products/{self.instance.store_id}/{self.instance.pk}/' if self.instance else None
+                    if not expected or not path.startswith(expected):
+                        raise serializers.ValidationError({'digital_file_url': 'Choose a digital asset uploaded for this product.'})
+            raw_data = getattr(self, 'initial_data', {}) or {}
+            errors: dict[str, str] = {}
+            if 'weight' in raw_data and raw_data['weight'] is not None and str(raw_data['weight']).strip() != '':
+                try:
+                    if Decimal(str(raw_data['weight'])) > Decimal('0.00'):
+                        errors['weight'] = 'Digital products cannot have a shipping weight.'
+                except Exception:
+                    pass
+            for dim_field in ('height', 'width', 'length'):
+                if dim_field in raw_data and raw_data[dim_field] is not None and str(raw_data[dim_field]).strip() != '':
+                    errors[dim_field] = f'Digital products cannot have physical {dim_field}.'
+            if errors:
+                raise serializers.ValidationError(errors)
+
+            attrs['weight'] = Decimal('0.00')
+            attrs['length'] = None
+            attrs['width'] = None
+            attrs['height'] = None
+            attrs['available'] = 0
+            if not file_url and not attrs.get('digital_file') and (not resumable_draft or attrs.get('visibility', getattr(self.instance, 'visibility', True)) or attrs.get('drop_at', getattr(self.instance, 'drop_at', None))):
+                raise serializers.ValidationError({
+                    'digital_file_url': 'Upload digital content before publishing or scheduling. You can save an unpublished draft first.',
+                })
+            asset_name = attrs['digital_file'].name if attrs.get('digital_file') else file_url
+            is_image_asset = is_image_digital_asset(asset_name)
+            if 'variants' in attrs or attrs.get('digital_file'):
+                allowed_types = allowed_variant_asset_types(asset_name)
+                for option in attrs.get('variants', getattr(self.instance, 'variants', [])):
+                    option_type = option.get('digital_file_type')
+                    option_url = option.get('digital_file_url')
+                    if option_url and option_type and digital_asset_kind(option_url) != option_type:
+                        raise serializers.ValidationError({'variants': 'Each variant type must match its uploaded content.'})
+                    if (option_type and option_type not in allowed_types) or (option_url and digital_asset_kind(option_url) not in allowed_types):
+                        raise serializers.ValidationError({'variants': 'Variant files for this product must be: ' + ', '.join(allowed_types) + '.'})
+            if not is_image_asset:
+                attrs['digital_preview_watermark'] = False
+            elif 'digital_preview_watermark' not in attrs and not getattr(self.instance, 'digital_preview_watermark', False):
+                attrs['digital_preview_watermark'] = True
+
+            price = attrs.get('price', getattr(self.instance, 'price', Decimal('0')))
+            discount = attrs.get('discount', getattr(self.instance, 'discount', 0))
+            for option in attrs.get('variants', getattr(self.instance, 'variants', [])):
+                if price * (100 - discount) / 100 + Decimal(str(option.get('price_delta') or '0')) <= 0:
+                    raise serializers.ValidationError({'variants': 'Each option must have a positive price.'})
+
+            if is_image_asset and not attrs.get('cover_image') and not attrs.get('digital_file') and not attrs.get('image_url') and not getattr(self.instance, 'image_url', '') and not file_url.startswith('https://minio.local/pending-asset-'):
+                attrs['image_url'] = normalize_media_url(file_url)
+        else:
+            price = attrs.get('price', getattr(self.instance, 'price', Decimal('0')))
+            discount = attrs.get('discount', getattr(self.instance, 'discount', 0))
+            for option in attrs.get('variants', getattr(self.instance, 'variants', [])):
+                if price * (100 - discount) / 100 + Decimal(str(option.get('price_delta') or '0')) <= 0:
+                    raise serializers.ValidationError({'variants': 'Each option must have a positive price.'})
+            attrs['digital_file_url'] = ''
+            attrs['digital_preview_watermark'] = False
+            if 'weight' not in attrs and not getattr(self.instance, 'weight', None):
+                attrs['weight'] = Decimal('1.00')
+            weight = attrs.get('weight', getattr(self.instance, 'weight', None))
+            if weight is not None and weight < Decimal('0.01'):
+                raise serializers.ValidationError({'weight': 'Ensure this value is greater than or equal to 0.01.'})
+            for field, default_val in (('length', Decimal('6.00')), ('width', Decimal('4.00')), ('height', Decimal('1.00'))):
+                value = attrs.get(field, getattr(self.instance, field, None))
+                if value is None:
+                    attrs[field] = default_val
+        return attrs
+
+
+class MerchantProductUploadSerializer(serializers.Serializer):
+    informational_video = serializers.FileField(required=False, allow_empty_file=False)
+    variant_files = serializers.ListField(child=serializers.FileField(allow_empty_file=False), required=False, max_length=100)
+    variant_indexes = ValidatedJSONField(required=False)
+    product = ValidatedJSONField(help_text='Product fields as a JSON object, using the merchant product schema.')
+    cover_image = serializers.ImageField(required=False, allow_empty_file=False)
+    digital_file = serializers.FileField(required=False, allow_empty_file=False)
+
+    def validate_product(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Provide a JSON object of product fields.')
+        return value
+
+
+class InventorySerializer(serializers.Serializer):
+    available = serializers.IntegerField(min_value=0, max_value=2147483647)
+
+
+class DashboardQuerySerializer(serializers.Serializer):
+    time_zone = TimeZoneField(default="UTC", max_length=100)
+    days = DashboardPeriodField(default=30, min_value=1, max_value=365)
+    low_stock_threshold = serializers.IntegerField(default=5, min_value=1, max_value=1000)
+
+
+class ProductAnalyticsQuerySerializer(serializers.Serializer):
+    time_zone = TimeZoneField(default="UTC", max_length=100)
+    days = DashboardPeriodField(default=30, min_value=1, max_value=365)
+
+
+class ScheduleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Schedule
+        fields = ['id', 'store', 'product', 'make_visible_at']
+        read_only_fields = ['id', 'store']
+
+
+class StoreInfoForProductCardSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Store
+        fields = ['username', 'name']
+
+
+class StoreImgSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StoreImg
+        fields = ['id', 'store', 'url']
+
+
+class StorePayoutSerializer(serializers.ModelSerializer):
+    account_details = serializers.SerializerMethodField()
+
+    def get_account_details(self, obj: StorePayout) -> dict[str, str]:
+        details = obj.account_details or {}
+        result = {
+            field: details[field]
+            for field in ('bank_name', 'account_holder_name')
+            if isinstance(details.get(field), str) and details[field]
+        }
+        for field in ('account_number', 'routing_number'):
+            value = details.get(field)
+            if isinstance(value, str) and value:
+                result[field.replace('_number', '_last4')] = value[-4:]
+        return result
+
+    store_name = serializers.CharField(source='store.name', read_only=True, default='')
+
+    class Meta:
+        model = StorePayout
+        fields = [
+            'id', 'store', 'store_name', 'wallet', 'amount', 'status', 'payout_method',
+            'account_details', 'reference', 'processed_at',
+            'notes', 'created', 'updated',
+        ]
+        read_only_fields = ['id', 'store', 'wallet', 'status', 'reference', 'processed_at', 'created', 'updated']
+
+
+class PayoutCreateSerializer(serializers.Serializer):
+    bank_account_id = serializers.IntegerField(required=False, min_value=1)
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('5.00'))
+    payout_method = serializers.ChoiceField(
+        choices=StorePayout.METHOD_CHOICES,
+        default=StorePayout.METHOD_BANK_TRANSFER,
+    )
+    account_details = serializers.DictField(required=False, default=dict)
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        method = attrs.get('payout_method', StorePayout.METHOD_BANK_TRANSFER)
+        account_id = attrs.get('bank_account_id')
+        if method != StorePayout.METHOD_BANK_TRANSFER and account_id:
+            raise serializers.ValidationError({'bank_account_id': 'Choose a bank account only for bank transfers.'})
+        if method == StorePayout.METHOD_BANK_TRANSFER:
+            if not account_id:
+                raise serializers.ValidationError({'bank_account_id': 'Select a verified saved bank account.'})
+            from core.models import BankAccount
+
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+            bank = BankAccount.objects.filter(
+                pk=account_id, user=user, verification_status='verified',
+            ).first() if user and user.is_authenticated else None
+            if bank is None:
+                raise serializers.ValidationError({'bank_account_id': 'Select one of your verified saved bank accounts.'})
+            # The view obtains the authoritative snapshot from the saved account.
+            attrs['account_details'] = {}
+        return attrs
+
+
+class StoreEarningsLedgerSerializer(serializers.ModelSerializer):
+    store_name = serializers.CharField(source='store.name', read_only=True)
+    store_username = serializers.CharField(source='store.username', read_only=True)
+
+    class Meta:
+        model = StoreEarningsLedger
+        fields = [
+            'id', 'wallet', 'store', 'store_name', 'store_username', 'order',
+            'entry_type', 'gross_amount', 'fee_amount', 'net_amount', 'status',
+            'available_at', 'cleared_at', 'description', 'reference',
+            'created', 'updated',
+        ]
+        read_only_fields = fields
+
+
+class MerchantStoreFinancialSummarySerializer(serializers.Serializer):
+    store_id = serializers.IntegerField()
+    store_name = serializers.CharField()
+    store_username = serializers.CharField()
+    status = serializers.CharField()
+    is_official = serializers.BooleanField()
+    gross_sales = serializers.CharField()
+    platform_fee_percent = serializers.CharField()
+    platform_fee_deducted = serializers.CharField()
+    net_sales = serializers.CharField()
+    in_review = serializers.CharField()
+    cleared_total = serializers.CharField()
+    payouts_completed = serializers.CharField()
+    payouts_pending = serializers.CharField()
+    available_balance = serializers.CharField()
+    refund_window_days = serializers.IntegerField()
+
+
+class MerchantWalletSerializer(serializers.Serializer):
+    wallet_id = serializers.IntegerField()
+    stripe_account_id = serializers.CharField(allow_blank=True)
+    stripe_details_submitted = serializers.BooleanField()
+    stripe_payouts_enabled = serializers.BooleanField()
+    available_balance = serializers.CharField()
+    pending_balance = serializers.CharField()
+    total_withdrawn = serializers.CharField()
+    total_gross_sales = serializers.CharField()
+    total_platform_fees = serializers.CharField()
+    total_net_sales = serializers.CharField()
+    refund_window_days = serializers.IntegerField()
+    platform_fee_percent = serializers.CharField()
+    stores_count = serializers.IntegerField()
+    stores = MerchantStoreFinancialSummarySerializer(many=True)
+
+
+class MerchantPayoutCreateSerializer(PayoutCreateSerializer):
+    bank_account_id = serializers.IntegerField(required=False, min_value=1)
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('5.00'))
+    payout_method = serializers.ChoiceField(
+        choices=StorePayout.METHOD_CHOICES,
+        default=StorePayout.METHOD_BANK_TRANSFER,
+    )
+    account_details = serializers.DictField(required=False, default=dict)
+    store_id = serializers.IntegerField(required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class UppercaseCarrierField(serializers.ChoiceField):
+    def to_internal_value(self, data: object) -> str:
+        return super().to_internal_value(str(data).upper())
+
+
+class MerchantTrackingSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(
+        choices=sorted(FULFILLMENT_TRANSITIONS), required=False
+    )
+    carrier = UppercaseCarrierField(choices=['USPS', 'UPS', 'FEDEX', 'DHL'], default='USPS')
+    tracking_number = serializers.CharField(max_length=100, allow_blank=True, required=False, default='')
+    event_description = serializers.CharField(max_length=1000, allow_blank=True, required=False, default='')
+
+
+class MerchantRefundItemSerializer(serializers.Serializer):
+    product = serializers.IntegerField(allow_null=True, required=False)
+    title = serializers.CharField()
+    image = serializers.CharField(allow_blank=True, default='')
+    quantity = serializers.IntegerField(default=1)
+    unit_price = serializers.CharField()
+    line_total = serializers.CharField()
+    is_digital = serializers.BooleanField(default=False)
+    variant = serializers.DictField(required=False, allow_null=True, default=None)
+
+
+class MerchantRefundSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    order = serializers.IntegerField(allow_null=True, required=False)
+    order_reference = serializers.CharField(allow_blank=True, default='')
+    customer_email = serializers.EmailField()
+    customer_name = serializers.CharField(allow_blank=True, default='')
+    status = serializers.ChoiceField(choices=['pending', 'approved', 'declined', 'failed'])
+    refund_type = serializers.ChoiceField(choices=['store_credit', 'original_payment'])
+    reason = serializers.CharField()
+    processing_reason = serializers.CharField(allow_blank=True, default='')
+    amount = serializers.CharField()
+    total_order_refund_amount = serializers.CharField()
+    items = MerchantRefundItemSerializer(many=True)
+    processed_at = serializers.DateTimeField(allow_null=True, required=False)
+    created = serializers.DateTimeField()
+    updated = serializers.DateTimeField()
+
+
+class MerchantRefundQuerySerializer(serializers.Serializer):
+    search = serializers.CharField(required=False, allow_blank=True)
+    status = serializers.ChoiceField(choices=['pending', 'approved', 'declined', 'failed'], required=False)
+    refund_type = serializers.ChoiceField(choices=['store_credit', 'original_payment'], required=False)
+    order_id = serializers.CharField(required=False, allow_blank=True)
+    refund_id = serializers.CharField(required=False, allow_blank=True)
+    days = serializers.IntegerField(required=False, min_value=1, max_value=365000)
+    date_from = serializers.CharField(required=False, allow_blank=True)
+    date_to = serializers.CharField(required=False, allow_blank=True)
+    start_date = serializers.CharField(required=False, allow_blank=True)
+    end_date = serializers.CharField(required=False, allow_blank=True)
+    ordering = serializers.ChoiceField(choices=['-created', 'created', '-updated', 'updated', '-amount', 'amount'], required=False, default='-created')
+
+
+class StoreTeamQuerySerializer(ListingQuerySerializer):
+    role = serializers.ChoiceField(choices=StoreTeamMember.ROLE_CHOICES, required=False)
+    paginated = serializers.BooleanField(required=False, default=False)
