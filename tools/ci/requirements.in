@@ -1,0 +1,5 @@
+pip==26.2.2
+pipenv==2026.10.3
+bandit==1.9.4
+pip-audit==2.10.1
+pip-tools==7.6.2

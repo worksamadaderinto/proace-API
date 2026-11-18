@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import datetime
+import json
+import math
+import os
+import pathlib
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+QA_REPORTS_DIR = REPO_ROOT / "qa-report"
+
+CATEGORY_DIRS = {
+    "load": QA_REPORTS_DIR / "performance" / "load",
+    "stress": QA_REPORTS_DIR / "performance" / "stress",
+    "volume": QA_REPORTS_DIR / "performance" / "volume",
+    "security": QA_REPORTS_DIR / "security",
+}
+
+
+def ensure_directories() -> None:
+    """Ensure all required QA report directories exist."""
+    for path in CATEGORY_DIRS.values():
+        path.mkdir(parents=True, exist_ok=True)
+    (QA_REPORTS_DIR / "bug-audit").mkdir(parents=True, exist_ok=True)
+
+
+def get_report_dir(category: str) -> pathlib.Path:
+    ensure_directories()
+    if category not in CATEGORY_DIRS:
+        raise ValueError(f"Unknown QA report category: {category}. Valid: {list(CATEGORY_DIRS.keys())}")
+    return CATEGORY_DIRS[category]
+
+
+def compute_percentiles(latencies_ms: List[float]) -> Dict[str, float]:
+    """Compute standard latency percentiles from a list of millisecond values."""
+    if not latencies_ms:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0,
+            "avg": 0.0,
+        }
+
+    sorted_lats = sorted(latencies_ms)
+    n = len(sorted_lats)
+
+    def percentile(p: float) -> float:
+        if n == 1:
+            return sorted_lats[0]
+        k = (n - 1) * (p / 100.0)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return sorted_lats[int(k)]
+        return sorted_lats[int(f)] * (c - k) + sorted_lats[int(c)] * (k - f)
+
+    return {
+        "count": n,
+        "min": round(sorted_lats[0], 2),
+        "p50": round(percentile(50), 2),
+        "p90": round(percentile(90), 2),
+        "p95": round(percentile(95), 2),
+        "p99": round(percentile(99), 2),
+        "max": round(sorted_lats[-1], 2),
+        "avg": round(sum(sorted_lats) / n, 2),
+    }
+
+
+def save_report(
+    category: str,
+    prefix: str,
+    markdown_content: str,
+    data_payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[pathlib.Path, pathlib.Path]:
+    """
+    Publishes the latest report, then prunes this runner’s older reports.
+    Returns (latest_md_path, latest_md_path) for existing runner compatibility.
+    """
+    target_dir = get_report_dir(category)
+    latest_file = target_dir / "latest.md"
+    temporary = target_dir / ".latest.md.tmp"
+    temporary.write_text(markdown_content, encoding="utf-8")
+    temporary.replace(latest_file)
+    if data_payload is not None:
+        temporary_json = target_dir / ".latest.json.tmp"
+        temporary_json.write_text(json.dumps(data_payload, indent=2, default=str), encoding="utf-8")
+        temporary_json.replace(target_dir / "latest.json")
+    # Publish replacements before pruning only this runner's superseded reports.
+    for extension in ("md", "json"):
+        for previous in target_dir.glob(f"{prefix}-*.{extension}"):
+            previous.unlink()
+    return latest_file, latest_file
+
+
+def print_banner(title: str, subtitle: str = "") -> None:
+    width = 72
+    print("=" * width)
+    print(f"  {title}".center(width))
+    if subtitle:
+        print(f"  {subtitle}".center(width))
+    print("=" * width)
+
+
+def print_table(headers: List[str], rows: List[List[Any]]) -> None:
+    """Print a clean CLI table."""
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, val in enumerate(row):
+            col_widths[idx] = max(col_widths[idx], len(str(val)))
+
+    header_str = " | ".join(f"{h:<{col_widths[i]}}" for i, h in enumerate(headers))
+    sep_str = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
+    print(header_str)
+    print(sep_str)
+    for row in rows:
+        print(" | ".join(f"{str(v):<{col_widths[i]}}" for i, v in enumerate(row)))
