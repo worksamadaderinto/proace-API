@@ -1,0 +1,107 @@
+from rest_framework import serializers
+from django.utils import timezone
+from affiliates.models import (
+    AffiliateWallet,
+    AffiliateWalletTransaction,
+    Marketer,
+    Referral,
+    Redirect,
+    Url,
+)
+
+
+class MarketerSerializer(serializers.ModelSerializer):
+    wallet_balance = serializers.DecimalField(
+        source="user.affiliate_wallet.balance",
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+        default="0.00",
+    )
+
+    class Meta:
+        model = Marketer
+        fields = [
+            "id",
+            "user",
+            "marketer_id",
+            "name",
+            "wallet_balance",
+            "created",
+            "updated",
+        ]
+        read_only_fields = ["id", "user", "marketer_id", "wallet_balance", "created", "updated"]
+
+
+class UrlSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Url
+        fields = [
+            "id",
+            "marketer",
+            "product",
+            "identifier",
+            "abs_url",
+            "active",
+            "created",
+            "updated",
+        ]
+        read_only_fields = ["id", "abs_url", "created", "updated"]
+
+
+class RedirectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Redirect
+        fields = [
+            "urlId",
+            "product_url",
+            "refferal_url",
+            "click_rate",
+            "last_clicked_at",
+            "created",
+        ]
+        read_only_fields = ['click_rate', 'last_clicked_at', 'created']
+
+    def create(self, validated_data):
+        redirect = Redirect.objects.create(**validated_data)
+        redirect.click_rate += 1
+        redirect.last_clicked_at = timezone.now()
+        redirect.save(update_fields=["click_rate", "last_clicked_at", "updated"])
+        return redirect
+
+
+class AffiliateWalletTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AffiliateWalletTransaction
+        fields = ["id", "amount", "transaction_type", "reason", "metadata", "created"]
+
+
+class AffiliateWalletSerializer(serializers.ModelSerializer):
+    transactions = AffiliateWalletTransactionSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = AffiliateWallet
+        fields = ["id", "balance", "transactions", "created", "updated"]
+
+
+class ReferralSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Referral
+        fields = [
+            "id",
+            "reward_amount",
+            "status",
+            "created",
+            "updated",
+        ]
+        read_only_fields = fields
+
+
+class ReferralPageSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    results = ReferralSerializer(many=True)
+
+
+class AffiliateLinkRequestSerializer(serializers.Serializer):
+    product = serializers.IntegerField(min_value=1)
+    identifier = serializers.RegexField(regex=r'^[A-Za-z0-9_-]+$', max_length=100, required=False, allow_blank=True)

@@ -1,0 +1,7 @@
+services:
+  app:
+    entrypoint:
+    - sleep
+    - infinity
+    image: docker/dev-environments-default:stable-1@sha256:c87f49259aaafad12a164d741c2c2fcf64c1c54685cd539ac98d411ebe9919ce
+    init: true

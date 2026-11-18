@@ -1,0 +1,42 @@
+from django.db import models
+from django.core.validators import MinValueValidator
+from django.conf import settings
+
+from product.models import Product
+from utils.mixins import DatesMixin
+
+
+
+
+
+class Cart(DatesMixin):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    ordered = models.BooleanField(default=False)
+ 
+
+class CartItem(DatesMixin):
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="cart_items")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    variant = models.CharField(max_length=80, blank=True, default='')
+    quantity = models.IntegerField(validators=[MinValueValidator(1)], default=1)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['cart', 'product', 'variant'],
+                name='unique_cart_product_variant',
+            ),
+        ]
+
+
+class GuestCartMerge(models.Model):
+    """Durable, account-scoped deduplication for a guest bag import."""
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    merge_key = models.UUIDField()
+    created = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=['user', 'merge_key'], name='unique_user_guest_cart_merge',
+        )]

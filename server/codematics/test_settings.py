@@ -1,0 +1,80 @@
+"""Test settings using SQLite, isolated from the main development database."""
+import os
+
+os.environ.setdefault("PASSWORD_PEPPER_ID", "test")
+os.environ.setdefault("PASSWORD_PEPPER_KEYS", '{"test":"1111111111111111111111111111111111111111111111111111111111111111"}')
+
+from .settings import *  # noqa: F403
+
+SECRET_KEY = 'merchant-tests-only-not-for-deployment'
+SIMPLE_JWT = {**SIMPLE_JWT, 'SIGNING_KEY': SECRET_KEY}  # noqa: F405
+DEBUG = False
+CELERY_TASK_ALWAYS_EAGER = True
+CATALOG_CACHE_WARM_ENABLED = False
+CELERY_TASK_EAGER_PROPAGATES = True
+CELERY_BROKER_URL = 'memory://'
+CELERY_RESULT_BACKEND = 'cache+memory://'
+INVITATION_TIMEOUT = 604800
+ALLOWED_HOSTS = ['testserver', 'localhost']
+INSTALLED_APPS = [
+    'django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes',
+    'django.contrib.sessions', 'django.contrib.messages', 'django.contrib.staticfiles',
+    'rest_framework', 'rest_framework_simplejwt.token_blacklist', 'taggit', 'core', 'store', 'product', 'cart', 'payment',
+    'notification.apps.EventNotificationConfig',
+    'observability.apps.ObservabilityConfig',
+    'affiliates',
+    'staff',
+    'drf_spectacular',
+    'storefront',
+]
+try:
+    import django_cleanup  # noqa: F401
+    INSTALLED_APPS.append('django_cleanup.apps.CleanupConfig')
+except ImportError:
+    pass
+MIDDLEWARE = [
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    "core.input_middleware.InputQueryValidationMiddleware",
+]
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage'},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+}
+MEDIA_URL = '/media/'
+ROOT_URLCONF = 'store.test_urls'
+TEST_DATABASE_PATH = os.environ.get("SQLITE_TEST_DATABASE_PATH") or os.path.join(BASE_DIR, "test.sqlite3")  # noqa: F405
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': TEST_DATABASE_PATH,
+        'TEST': {'NAME': TEST_DATABASE_PATH},
+        'OPTIONS': {'timeout': 30},
+    }
+}
+PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
+EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+DEFAULT_FROM_EMAIL = 'Proace <hello@proace.test>'
+RESEND_API_KEY = 're_test_key'
+RESEND_FROM_EMAIL = DEFAULT_FROM_EMAIL
+FRONTEND_URL = 'http://testserver'
+_INPUT_PARSERS = REST_FRAMEWORK.get(
+    "DEFAULT_PARSER_CLASSES",
+    [
+        "core.parsers.ValidatedJSONParser",
+        "core.parsers.ValidatedFormParser",
+        "core.parsers.ValidatedMultiPartParser",
+    ],
+)
+REST_FRAMEWORK = {
+    "DEFAULT_PARSER_CLASSES": _INPUT_PARSERS,
+    'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated'],
+    'DEFAULT_AUTHENTICATION_CLASSES': ['core.access.BackofficeJWTAuthentication'],
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'EXCEPTION_HANDLER': 'utils.exceptions.custom_exception_handler',
+}
+
+SHIPPING_RATE_MODE = 'demo'
+ELASTICSEARCH_ENABLED = False
