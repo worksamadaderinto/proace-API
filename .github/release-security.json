@@ -1,0 +1,12 @@
+{
+  "environment": "production",
+  "required_checks": [
+    "Supply-chain policy",
+    "Test",
+    "Security and Vulnerability Checks",
+    "CodeQL",
+    "Build API image"
+  ],
+  "independent_review_required": false,
+  "owner_mode": "sole-maintainer"
+}

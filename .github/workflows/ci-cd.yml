@@ -1,0 +1,309 @@
+name: API — security, test, build, HostGator
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  DJANGO_SETTINGS_MODULE: codematics.test_settings
+  DATABASE_ENGINE: sqlite
+  SECRET_KEY: ci-only-not-for-production
+  SQLITE_DATABASE_PATH: ${{ github.workspace }}/server/storefront.sqlite3
+  SQLITE_TEST_DATABASE_PATH: ${{ github.workspace }}/server/test.sqlite3
+  PIPENV_VENV_IN_PROJECT: "1"
+
+jobs:
+  supply-chain:
+    name: Supply-chain policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Audit runner activity
+        if: vars.STEPSECURITY_ENABLED == 'true'
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 scripts/check_supply_chain.py
+      - run: python3 -m unittest discover -s scripts -p "test_release_security.py"
+      - run: python3 -m unittest discover -s scripts -p "test_supply_chain.py"
+      - run: python3 -m unittest discover -s scripts -p "test_python_lock.py"
+      - run: python3 -m unittest discover -s scripts -p "test_release_artifact.py"
+      - run: python3 -m unittest discover -s scripts -p "test_host_release.py"
+      - run: python3 -m unittest discover -s scripts -p "test_deploy_sequence.py"
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - name: Audit runner activity
+        if: vars.STEPSECURITY_ENABLED == 'true'
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Pipenv
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r ../tools/ci/requirements.lock
+
+      - name: Install dependencies
+        run: |
+          pipenv verify
+          pipenv sync --dev
+
+      - name: Django system check
+        run: pipenv run python manage.py check --settings=codematics.test_settings
+
+      - name: Run tests with coverage
+        run: pipenv run coverage run -m pytest --verbose
+
+      - name: Coverage report
+        run: pipenv run coverage report --show-missing
+
+      - name: Storefront API integration tests
+        run: pipenv run python manage.py test storefront --settings=codematics.test_settings --noinput
+
+  security:
+    name: Security and Vulnerability Checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - name: Audit runner activity
+        if: vars.STEPSECURITY_ENABLED == 'true'
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install scanners and app dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r ../tools/ci/requirements.lock
+          pipenv verify
+          pipenv sync --dev
+
+      - name: Audit installed Python packages
+        run: |
+          project_site=$(pipenv run python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+          python -m pip_audit --path "$project_site"
+
+      - name: Audit exact production and CI tool locks
+        run: |
+          python -m pip_audit --requirement requirements.lock --require-hashes --no-deps --disable-pip
+          python -m pip_audit --requirement requirements-stream.lock --require-hashes --no-deps --disable-pip
+          python -m pip_audit --requirement ../tools/ci/requirements.lock --require-hashes --no-deps --disable-pip
+
+      - name: Static security scan
+        run: bandit -r . -x "./.venv,./*/migrations,./*/tests.py" --severity-level medium
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Filesystem vulnerability scan
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: false
+          format: table
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Audit runner activity
+        if: vars.STEPSECURITY_ENABLED == 'true'
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
+        with:
+          languages: python
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
+
+  build:
+    name: Build API image
+    runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.handoff.outputs.sha256 }}
+    needs: [test, security, codeql]
+    steps:
+      - name: Audit runner activity
+        if: vars.STEPSECURITY_ENABLED == 'true'
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Vault deployment credential handling
+        run: python3 -m unittest discover -s scripts -p "test_vault_ci.py"
+      - run: API_IMAGE=proace-api:ci STREAM_IMAGE=proace-api-stream:ci POSTGRES_USER=commerce POSTGRES_DB=commerce docker compose --env-file /dev/null -f deploy/hostgator/runtime.compose.yaml config --quiet
+      - run: docker compose --env-file /dev/null -f deploy/vault/compose.yaml config --quiet
+      - name: Build reviewed API and stream images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --build-arg INSTALL_OBJECT_STORAGE=true -t "proace-api:$GITHUB_SHA" server
+          docker build --build-arg INSTALL_OBJECT_STORAGE=true --build-arg INSTALL_STREAM_POOL=true -t "proace-api-stream:$GITHUB_SHA" server
+          docker run --rm --entrypoint python -e DATABASE_ENGINE=sqlite -e SECRET_KEY -e DJANGO_SETTINGS_MODULE=codematics.test_settings "proace-api:$GITHUB_SHA" manage.py check
+      - name: Pack reviewed images
+        id: handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_artifact.py pack "$RUNNER_TEMP/api-release.tgz" "$GITHUB_SHA"
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/api-release.tgz" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: api-release-${{ github.sha }}
+          path: ${{ runner.temp }}/api-release.tgz
+          retention-days: 2
+          if-no-files-found: error
+
+  attest-release:
+    name: Sign release provenance
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Audit runner activity
+        if: vars.STEPSECURITY_ENABLED == 'true'
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: api-release-${{ github.sha }}
+          path: ${{ runner.temp }}/attest-release
+      - name: Sign provenance for the exact handoff
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest-release/api-release.tgz
+
+  deploy:
+    name: Deploy to HostGator
+    runs-on: ubuntu-latest
+    needs:
+      - supply-chain
+      - test
+      - security
+      - codeql
+      - build
+      - attest-release
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    concurrency:
+      group: api-production
+      cancel-in-progress: false
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+      id-token: write
+    steps:
+      - name: Audit runner activity
+        if: vars.STEPSECURITY_ENABLED == 'true'
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify live release controls
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_HARDENING_ENABLED: ${{ vars.STEPSECURITY_ENABLED }}
+          VAULT_IDENTITY_REVIEWED: ${{ vars.VAULT_IDENTITY_REVIEWED }}
+        run: python3 scripts/release_security.py preflight
+      - name: Install integrity-locked signature verifier before credentials
+        run: python3 scripts/release_security.py install-cli --directory "$RUNNER_TEMP/security-tools"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: api-release-${{ github.sha }}
+          path: ${{ runner.temp }}/prepared-api
+      - name: Verify signed provenance before unpacking or credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_security.py verify-artifact --cli "$RUNNER_TEMP/security-tools/gh" --artifact "$RUNNER_TEMP/prepared-api/api-release.tgz"
+      - name: Verify reviewed image handoff before fetching credentials
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
+        run: python3 scripts/release_artifact.py verify "$RUNNER_TEMP/prepared-api/api-release.tgz" "$EXPECTED_SHA256" "$GITHUB_SHA"
+      - name: Fetch scoped deployment credential from Vault
+        env:
+          VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+          VAULT_ROLE: ${{ vars.VAULT_ROLE }}
+        run: python3 scripts/vault_ci.py --address "$VAULT_ADDR" --role "$VAULT_ROLE" --path kv/data/proace/production/api-deploy --output "$RUNNER_TEMP/proace-vault/deploy.json"
+      - name: Deploy reviewed API images through verified SSH
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
+        run: python3 scripts/deploy_hostgator.py "$RUNNER_TEMP/proace-vault/deploy.json" "$RUNNER_TEMP/prepared-api/api-release.tgz" "$EXPECTED_SHA256" "$GITHUB_SHA"
+      - name: Remove temporary deployment credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/proace-vault"
