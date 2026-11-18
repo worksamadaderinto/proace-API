@@ -1,0 +1,447 @@
+"""Canonical serializers module for the staff application."""
+from decimal import Decimal
+from typing import Any
+from utils.timezones import DashboardPeriodField, TimeZoneField
+from django.utils import timezone
+from django.contrib.auth.password_validation import validate_password
+from rest_framework import serializers
+
+from core.models import User
+from core.serializers import UserSerializer
+from payment.models import Coupon, CouponRedemption, Order
+from payment.serializers import OrdersSerializer
+from storefront.serializers import CouponAdminSerializer
+from payment.services import available_order_status_transitions
+from product.models import Product, ProductModerationEvent
+from staff.models import Post, Content, Comment
+from store.models import Store
+from store.serializers import StoreSerializer, StoreInfoSerializer
+from taggit.serializers import TagListSerializerField, TaggitSerializer
+
+
+class TreasuryWithdrawalSerializer(serializers.Serializer):
+    bank_account_id = serializers.IntegerField(required=False, min_value=1)
+    stripe_destination_id = serializers.IntegerField(required=False, min_value=1)
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal('0.01'))
+    payout_method = serializers.ChoiceField(choices=['stripe', 'bank'], default='stripe')
+    account_details = serializers.DictField(required=False, default=dict)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        payout_method = attrs.get('payout_method', 'stripe')
+        if payout_method == 'bank' and not attrs.get('bank_account_id'):
+            raise serializers.ValidationError({'bank_account_id': 'Select a saved bank account.'})
+        if payout_method == 'stripe' and not attrs.get('stripe_destination_id'):
+            raise serializers.ValidationError({'stripe_destination_id': 'Select a saved Stripe destination.'})
+        if payout_method == 'bank' and attrs.get('stripe_destination_id'):
+            raise serializers.ValidationError({'stripe_destination_id': 'Choose a Stripe destination only for Stripe transfers.'})
+        if payout_method == 'stripe' and attrs.get('bank_account_id'):
+            raise serializers.ValidationError({'bank_account_id': 'Choose a bank account only for bank transfers.'})
+        return attrs
+
+
+class TreasuryWithdrawalDecisionSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=('complete', 'fail'))
+    note = serializers.CharField(max_length=1000)
+
+    def validate_note(self, value: str) -> str:
+        note = value.strip()
+        if not note:
+            raise serializers.ValidationError(
+                'A processing note is required for every treasury decision.'
+            )
+        return note
+
+
+class PayoutDecisionSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=("approve", "reject"))
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=1000)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        reason = str(attrs.get("reason", "")).strip()
+        if attrs["action"] == "reject" and not reason:
+            raise serializers.ValidationError(
+                {"reason": "A reason is required to reject a payout."}
+            )
+        attrs["reason"] = reason
+        return attrs
+
+
+class RefundDecisionSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=("approve", "decline"))
+    reason = serializers.CharField(max_length=1000)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        reason = attrs["reason"].strip()
+        if not reason:
+            raise serializers.ValidationError(
+                {"reason": "A reason is required to process a refund."}
+            )
+        attrs["reason"] = reason
+        return attrs
+
+
+class PostSerializer(TaggitSerializer, serializers.ModelSerializer):
+    tags = TagListSerializerField()
+
+    class Meta:
+        model = Post
+        fields = [
+            "id",
+            "staff",
+            "title",
+            "tags",
+            "created",
+            "updated",
+        ]
+
+
+class ContentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Content
+        fields = [
+            "id",
+            "blog_id",
+            "content",
+        ]
+
+
+class CommentSerializer(serializers.ModelSerializer):
+    owner = serializers.ReadOnlyField(source="owner.username")
+
+    class Meta:
+        model = Comment
+        fields = ["id", "body", "owner", "post"]
+
+
+class BackofficeStoreSerializer(StoreSerializer):
+    bulk_actions = serializers.SerializerMethodField()
+    avatar_url = serializers.SerializerMethodField()
+    owner_email = serializers.EmailField(source="user.email", read_only=True)
+    owner_name = serializers.SerializerMethodField()
+
+    class Meta(StoreSerializer.Meta):
+        fields = StoreSerializer.Meta.fields + ["owner_email", "owner_name", "avatar_url", "bulk_actions"]
+
+    def get_bulk_actions(self, store) -> list[str]:
+        from staff.bulk_policy import bulk_actions_for
+        request = self.context.get('request')
+        return bulk_actions_for('stores', store, request.user) if request else []
+
+    def get_avatar_url(self, store: Store) -> str:
+        profiles = sorted(store.storeinfo_set.all(), key=lambda profile: profile.pk)
+        if not profiles:
+            return ""
+        return StoreInfoSerializer(profiles[0]).data.get("avatar_url") or ""
+
+    def get_owner_name(self, store):
+        if not store.user:
+            return ""
+        return f"{store.user.first_name} {store.user.last_name}".strip()
+
+
+class StoreModerationSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=1000)
+
+    def block(self, store, staff_user):
+        if store.is_official:
+            raise serializers.ValidationError({"detail": "Official company stores cannot be blocked."})
+        store.status = Store.STATUS_BLOCKED
+        store.blocked_reason = self.validated_data.get("reason", "")
+        store.blocked_at = timezone.now()
+        store.blocked_by = staff_user
+        store.save(update_fields=["status", "blocked_reason", "blocked_at", "blocked_by", "updated"])
+        return store
+
+    def unblock(self, store):
+        store.status = Store.STATUS_ACTIVE
+        store.blocked_reason = ""
+        store.blocked_at = None
+        store.blocked_by = None
+        store.save(update_fields=["status", "blocked_reason", "blocked_at", "blocked_by", "updated"])
+        return store
+
+
+class StaffUserSerializer(UserSerializer):
+    bulk_actions = serializers.SerializerMethodField()
+
+    def get_bulk_actions(self, user) -> list[str]:
+        from staff.bulk_policy import bulk_actions_for
+        request = self.context.get("request")
+        return bulk_actions_for("users", user, request.user) if request else []
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "bulk_actions",
+            "email",
+            "first_name",
+            "last_name",
+            "phone1",
+            "phone2",
+            "gender",
+            "avatar_url",
+            "is_staff",
+            "is_superuser",
+            "is_business_admin",
+            "must_change_password",
+            "role",
+            "is_active",
+            "staff_email_verified",
+            "staff_blocked_at",
+            "date_joined",
+            "updated",
+            "last_login",
+            "last_active_at",
+        ]
+        read_only_fields = fields
+
+
+class StaffCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "email",
+            "first_name",
+            "last_name",
+            "phone1",
+            "phone2",
+            "gender",
+            "is_staff",
+            "is_active",
+            "date_joined",
+        ]
+        read_only_fields = ["id", "is_staff", "is_active", "date_joined"]
+
+    def validate_email(self, value: str) -> str:
+        email = value.strip().lower()
+        if User.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError("An account with this email already exists.")
+        return email
+
+    def validate(self, attrs):
+        if "password" in self.initial_data:
+            raise serializers.ValidationError({"password": "Passwords are generated privately by the server."})
+        return attrs
+
+    def create(self, validated_data):
+        from core.onboarding import invite_staff
+        return invite_staff(validated_data)
+
+
+class StaffPermissionSerializer(serializers.Serializer):
+    def to_internal_value(self, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise serializers.ValidationError("Expected an object of permission fields.")
+        unsupported_fields = set(data) - {"is_active"}
+        if unsupported_fields:
+            raise serializers.ValidationError(
+                {field: "This field is not supported." for field in unsupported_fields}
+            )
+        return super().to_internal_value(data)
+
+    is_active = serializers.BooleanField(required=False)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if not attrs:
+            raise serializers.ValidationError("Provide is_active.")
+        return attrs
+
+    def update(self, user: User) -> User:
+        previous_active, previous_staff = user.is_active, user.is_staff
+        if user.is_superuser or user.is_business_admin:
+            raise serializers.ValidationError("Administrator accounts cannot be changed by peers.")
+        if self.validated_data.get("is_active") and user.is_staff and not user.staff_email_verified:
+            raise serializers.ValidationError("Staff mailbox verification is required.")
+        if all(getattr(user, field) == value for field, value in self.validated_data.items()):
+            return user
+        if "is_active" in self.validated_data:
+            user.is_active = self.validated_data["is_active"]
+        user.credential_version += 1
+        user.save(update_fields=["is_active", "credential_version"])
+        from notification.views import account_access_notification
+
+        account_access_notification(user, previous_active, previous_staff)
+        return user
+
+
+class BackofficeOrderSerializer(OrdersSerializer):
+    buyer_email = serializers.EmailField(source="user.email", read_only=True)
+    buyer_phone = serializers.SerializerMethodField()
+    allowed_status_transitions = serializers.SerializerMethodField()
+
+    class Meta(OrdersSerializer.Meta):
+        fields = ["id", *OrdersSerializer.Meta.fields, "buyer_email", "buyer_phone", "allowed_status_transitions"]
+
+    def get_allowed_status_transitions(self, obj: Order) -> list[str]:
+        return available_order_status_transitions(obj)
+
+    def get_buyer_phone(self, obj: Order) -> str:
+        return str(getattr(obj, "buyer_phone", "") or (getattr(obj.user, "phone1", "") if obj.user else "") or "")
+
+
+class CouponRedemptionSerializer(serializers.ModelSerializer):
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+    order_id = serializers.CharField(source="order.orderId", read_only=True)
+
+    class Meta:
+        model = CouponRedemption
+        fields = ["id", "user_email", "order_id", "created"]
+
+
+class BackofficeCouponSerializer(CouponAdminSerializer):
+    created_by = serializers.SerializerMethodField()
+    redemptions = CouponRedemptionSerializer(many=True, read_only=True)
+
+    class Meta(CouponAdminSerializer.Meta):
+        model = Coupon
+        fields = [*CouponAdminSerializer.Meta.fields, "redemptions"]
+
+    def get_created_by(self, obj: Coupon) -> str:
+        return obj.created_by.email if obj.created_by else ""
+
+
+class CouponUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Coupon
+        fields = ["valid_to", "discount", "num_available", "active"]
+
+    def validate_num_available(self, value):
+        if self.instance and value < self.instance.num_used:
+            raise serializers.ValidationError("Availability cannot be lower than the number already used.")
+        return value
+
+    def validate(self, attrs):
+        active = attrs.get("active", getattr(self.instance, "active", True))
+        num_avail = attrs.get("num_available", getattr(self.instance, "num_available", 0))
+        num_used = getattr(self.instance, "num_used", 0)
+        if active and num_avail <= num_used:
+            raise serializers.ValidationError({"active": "Cannot activate a coupon that has exhausted all available redemptions."})
+        valid_to = attrs.get("valid_to")
+        if valid_to and self.instance and self.instance.valid_from and valid_to <= self.instance.valid_from:
+            raise serializers.ValidationError({"valid_to": "Expiration date must be after creation date."})
+        return attrs
+
+
+class OrderStatusOverrideSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=[
+        "pending", "confirmed", "shipped", "delivered", "picked up", "cancelled",
+    ])
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=1000, default="Confirmed by backoffice operator")
+
+    def validate_status(self, value):
+        if value == "refunded":
+            raise serializers.ValidationError("Use the refund workflow to refund an order.")
+        return value
+
+
+class DashboardQuerySerializer(serializers.Serializer):
+    time_zone = TimeZoneField(default="UTC", max_length=100)
+    days = DashboardPeriodField(default=30, min_value=1, max_value=365)
+
+
+class ProductModerationEventSerializer(serializers.ModelSerializer):
+    actor_email = serializers.EmailField(source="actor.email", read_only=True, default="")
+
+    class Meta:
+        model = ProductModerationEvent
+        fields = ["id", "action", "reason", "actor_email", "created"]
+
+
+class StoreAuditProductSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+    price = serializers.CharField()
+    sales = serializers.IntegerField(read_only=True)
+    has_digital_asset = serializers.SerializerMethodField()
+    available = serializers.SerializerMethodField()
+    blocked_by_email = serializers.EmailField(source="blocked_by.email", read_only=True, default=None)
+    moderation_events = ProductModerationEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Product
+        fields = [
+            "id", "title", "category", "price", "sales", "visibility", "image_url",
+            "is_blocked", "blocked_reason", "blocked_at", "blocked_by_email",
+            "moderation_events",
+            "is_digital", "has_digital_asset", "available", "created", "updated",
+            "product_type", "affiliate_hoplink", "affiliate_vendor_nickname", "affiliate_button_text",
+        ]
+
+    def get_image_url(self, obj: Product) -> str:
+        from utils.functions import normalize_media_url
+
+        for image in obj.images.all():
+            if image.image:
+                return normalize_media_url(image.image.url)
+        return normalize_media_url(obj.image_url) if obj.image_url else ''
+
+    def get_has_digital_asset(self, obj) -> bool:
+        return bool(obj.digital_file_url)
+
+    def get_available(self, obj):
+        if obj.is_digital:
+            return None
+        return obj.available
+
+
+class StaffWalletTransactionSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    type = serializers.CharField()
+    source = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+    description = serializers.CharField(allow_blank=True)
+    created = serializers.DateTimeField()
+
+
+class StaffCustomerWalletSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    balance = serializers.DecimalField(max_digits=15, decimal_places=2)
+    transactions = StaffWalletTransactionSerializer(many=True)
+
+
+class StaffUserOrderSerializer(serializers.Serializer):
+    updated = serializers.DateTimeField()
+    id = serializers.IntegerField()
+    reference = serializers.CharField()
+    created = serializers.DateTimeField()
+    status = serializers.CharField()
+    total = serializers.DecimalField(max_digits=15, decimal_places=2)
+
+
+class StaffUserActivitySerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    verb = serializers.CharField()
+    description = serializers.CharField(allow_blank=True, allow_null=True)
+    created = serializers.DateTimeField()
+    level = serializers.CharField()
+
+
+class StaffUserDetailSerializer(serializers.Serializer):
+    user = StaffUserSerializer()
+    wallet = StaffCustomerWalletSerializer()
+    orders = StaffUserOrderSerializer(many=True)
+    order_count = serializers.IntegerField()
+    total_orders = serializers.IntegerField()
+    lifetime_spent = serializers.DecimalField(max_digits=15, decimal_places=2)
+    activity = StaffUserActivitySerializer(many=True)
+    referral = serializers.DictField(required=False, allow_null=True)
+    affiliate = serializers.DictField(required=False, allow_null=True)
+
+
+class StaffUserOrderQuerySerializer(serializers.Serializer):
+    order_search = serializers.CharField(required=False, allow_blank=True, default="")
+    order_status = serializers.ChoiceField(choices=["", *dict(Order.ORDER_STATUS_CHOICE)], default="")
+    order_carrier = serializers.ChoiceField(choices=["", "USPS", "UPS", "FEDEX", "DHL", "DIGITAL"], default="")
+    order_payment = serializers.ChoiceField(choices=["", "card", "wallet", "cash_on_delivery", "stripe_wallet"], default="")
+    order_ordering = serializers.ChoiceField(choices=["-created", "created", "-total", "total"], default="-created")
+    order_offset = serializers.IntegerField(min_value=0, default=0)
+
+
+class ProductModerationSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=['block', 'unblock', 'restore'])
+    reason = serializers.CharField(max_length=2000, trim_whitespace=True, allow_blank=False)
+
+
+class PartnerInvitationSerializer(serializers.Serializer):
+    email = serializers.EmailField()

@@ -1,0 +1,308 @@
+import os
+import logging
+
+from django.db.models import Count, Prefetch
+from django.core.cache import cache
+from django.core.paginator import Paginator
+from django.shortcuts import get_object_or_404, get_list_or_404
+
+from store.models import Store
+from rest_framework.filters import SearchFilter, OrderingFilter
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.generics import ListAPIView
+from rest_framework import viewsets
+
+
+from core.models import Review, Wishlist
+
+from product.models import Product, ProductImg, Specification
+from product.serializers import (
+    ProductCardSerializer,
+    ProductImgSerializer,
+    ProductSerializer,
+    SpecificationSerializer
+)
+
+from kink import di
+from drf_spectacular.utils import extend_schema
+from rest_framework.decorators import action, parser_classes
+
+from core.parsers import ValidatedMultiPartParser as MultiPartParser
+
+# Create your views here.
+
+from product.cache import (
+    PRODUCT_CACHE_TIMEOUT, LANDING_PRODUCTS_CACHE_KEY, product_cache_key,
+    store_product_cache_key, invalidate_product_cache, get_cached_product_data,
+    get_cached_store_product_data, get_cached_landing_products,
+)
+
+logger = logging.getLogger("codematics.product")
+
+
+class ProductViewSet(viewsets.GenericViewSet):
+    user_store: Store = di[Store]
+    product_specification: Specification = di[Specification]
+    store_product: Product = di[Product]
+    
+    
+    def get_images(self, request, productId):
+        product_images = get_list_or_404(ProductImg, product=productId)
+        serializer = ProductImgSerializer(product_images, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def get_image(self, request, id):
+        product_image = get_object_or_404(ProductImg, product=id)
+        serializer = ProductImgSerializer(product_image)
+        return Response(serializer.data)
+
+    def delete_image(self, request, id):
+        product_image = get_object_or_404(ProductImg, product=id)
+        invalidate_product_cache(product_image.product)
+        product_image.delete()
+        return Response(status=status.HTTP_202_ACCEPTED)
+
+    def get_product(self, request, productId):
+        cached_product = cache.get(product_cache_key(productId))
+        if cached_product is not None and not request.user.is_authenticated:
+            return Response(cached_product, status=status.HTTP_200_OK)
+
+        products = Product.objects.filter(
+            visibility=True, is_blocked=False,
+        ).annotate(
+            likes_count=Count("wishlist", distinct=True)
+        ).prefetch_related("images")
+        if request.user.is_authenticated:
+            products = products.prefetch_related(
+                Prefetch(
+                    "wishlist_set",
+                    queryset=Wishlist.objects.filter(user=request.user),
+                    to_attr="user_likes",
+                )
+            )
+        product = get_object_or_404(products, id=productId)
+
+        
+        serializer = ProductSerializer(product, context={"request": request})
+        related_products = Product.objects.filter(
+                category=product.category,
+                visibility=True, is_blocked=False,
+            ).exclude(id=product.id)[:5]
+        data = get_cached_product_data(product.id)
+        cache.set(product_cache_key(product.id), data, PRODUCT_CACHE_TIMEOUT)
+        return Response(data, status=status.HTTP_200_OK)
+
+
+    def delete_product(self, request, productId):
+        from rest_framework.exceptions import ValidationError
+        product = get_object_or_404(Product, id=productId)
+        if product.is_blocked:
+            raise ValidationError({'detail': 'Blocked products cannot be deleted while under platform moderation.'})
+        invalidate_product_cache(product)
+        product.delete()
+        return Response(status=status.HTTP_202_ACCEPTED)
+
+
+    def get_reviews(self, request, productId):
+        from core.serializers import ReviewsSerializer
+
+        reviews = get_list_or_404(Review, product=productId)
+
+        page_number = request.GET.get('offset', 1)
+        per_page = request.GET.get('limit', 15)
+        paginator = Paginator(reviews, per_page=per_page)
+        items = paginator.get_page(number=page_number)
+        serializer = ReviewsSerializer(items, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+    def landing_page_products(self, request):
+            cached_products = cache.get(LANDING_PRODUCTS_CACHE_KEY)
+            if cached_products is not None:
+                return Response(cached_products, status=status.HTTP_200_OK)
+
+            data = get_cached_landing_products()
+            cache.set(LANDING_PRODUCTS_CACHE_KEY, data, PRODUCT_CACHE_TIMEOUT)
+            return Response(data, status=status.HTTP_200_OK)
+            
+    @extend_schema(request=SpecificationSerializer, responses={status.HTTP_200_OK: dict})
+    @action(detail=False, methods=['delete'], url_path='specifications/delete')
+    def delete_specifications(self, request, product):
+        specification = get_object_or_404(self.product_specification, product=product)
+        specification.delete()
+        return Response(status=status.HTTP_202_ACCEPTED)
+
+
+    @extend_schema(request=SpecificationSerializer, responses={status.HTTP_200_OK: dict})
+    @action(detail=False, methods=['get'], url_path='specifications/get')
+    def get_specifications(self, request, product):
+        specifications = self.product_specification.objects.filter(product=product)
+        serializer = SpecificationSerializer(specifications, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(request=ProductSerializer, responses={status.HTTP_200_OK: dict})
+    @action(detail=False, methods=['delete'], url_path='product/delete')
+    def delete(self, request, store, product):
+        from rest_framework.exceptions import ValidationError
+        product = get_object_or_404(self.store_product, store=store, id=product)
+        if product.is_blocked:
+            raise ValidationError({'detail': 'Blocked products cannot be deleted while under platform moderation.'})
+        invalidate_product_cache(product)
+        product.delete()
+        return Response(status=status.HTTP_202_ACCEPTED)
+
+
+
+    @extend_schema(request=ProductSerializer, responses={status.HTTP_200_OK: dict})
+    @action(detail=False, methods=['put', 'patch'], url_path='product/update')
+    def edit_product(self, request, storeId, productId):
+        data = request.data
+        product = get_object_or_404(
+            self.store_product,
+            store=storeId,
+            id=productId,
+            store__user=request.user,
+        )
+
+        old_price = str(product.price)
+        old_stock = product.available
+        serializer = ProductSerializer(product, data=data)
+        serializer.is_valid(raise_exception=True)
+        product = serializer.save()
+        invalidate_product_cache(product)
+        from product.tasks import dispatch_wishlist_alerts_task
+        transaction.on_commit(lambda: dispatch_wishlist_alerts_task.delay(product.pk, old_price, old_stock))
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        
+
+    @extend_schema(request=ProductSerializer, responses={status.HTTP_200_OK: dict})
+    @action(detail=False, methods=['get'], url_path='product/get')
+    def get_store_product(self, request, storeId, productId):
+        cached_product = cache.get(store_product_cache_key(storeId, productId))
+        if cached_product is not None:
+            return Response(cached_product, status=status.HTTP_200_OK)
+
+        product = get_object_or_404(
+            self.store_product,
+            store=storeId,
+            id=productId,
+            visibility=True, is_blocked=False,
+        )
+
+        
+        data = get_cached_store_product_data(storeId, productId)
+        cache.set(
+            store_product_cache_key(storeId, productId),
+            data,
+            PRODUCT_CACHE_TIMEOUT,
+        )
+        return Response(data, status=status.HTTP_200_OK)
+
+
+
+    def store_product_image(self, request, storeId, product, image):
+        product = get_object_or_404(ProductImg, id=image, product=product)
+        serializer = ProductImgSerializer(product)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+
+    def store_product_images(self, request, storeId, productId):
+        product = ProductImg.objects.filter(product=productId)
+        serializer = ProductImgSerializer(product, many=True)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+
+    @parser_classes([MultiPartParser])
+    def store_add_product_image(self, request):
+            data = request.data
+            serializer = ProductImgSerializer(data=data)
+            serializer.is_valid(raise_exception=True)
+            product_image = serializer.save()
+            invalidate_product_cache(product_image.product)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+    
+
+
+    def create_specifications(self, request):
+            data = request.data
+            serializer = SpecificationSerializer(data=data, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        
+
+
+    def delete_file(self, request, product, store, filename):
+
+            ext = filename.split(".")[-1]
+            filenamenoExt = filename.replace(f"{ext}", "")
+            fileDir = "%s/%s.%s" % ("img", filenamenoExt, ext)
+            if os.path.isfile((f"media/images/{filename}")):
+                try:
+                    os.remove(fileDir)
+                except OSError:
+                    logger.exception(
+                        "Failed to delete product file",
+                        extra={"product": product, "store": store, "filename": filename},
+                    )
+                    return Response(
+                        {"detail": "Could not delete file."},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+                return Response(f"{filename} deleted", status=status.HTTP_202_ACCEPTED)
+            return Response("file not found", status=status.HTTP_404_NOT_FOUND)
+
+
+
+class SearchProductViewSet(ListAPIView):
+    serializer_class = ProductCardSerializer
+
+    search_fields = (
+        'title',
+        'description',
+        'category',
+        'discount',
+        'average_rating',
+        'tags',
+        'store',
+        'price'
+    )
+
+    filter_backends = [SearchFilter, OrderingFilter]
+    ordering_fields = ['price', 'average_rating', 'discount']
+
+    def get_queryset(self):
+        return Product.objects.filter(
+            visibility=True, is_blocked=False,
+        ).annotate(
+            likes_count=Count("wishlist", distinct=True)
+        )
+
+    def get_serializer_context(self):
+        return {'request': self.request}
+    
+class IsOwnerSearchProduct(ListAPIView):
+
+        serializer_class = ProductSerializer
+    
+
+        filter_backends = [SearchFilter, OrderingFilter]
+        search_fields = (
+            "title",
+            "description",
+            "category",
+            "discount",
+            "average_rating",
+            "tags",
+            "store",
+            "price",
+        )
+
+        ordering_fields = ["price", "average_rating", "discount"]
+
+        def get_queryset(self):
+            store = self.request.data.get("store") if hasattr(self.request, 'data') else None
+            return self.store_product.objects.filter(store=store).prefetch_related("tags", "images")

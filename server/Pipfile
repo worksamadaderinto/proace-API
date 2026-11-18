@@ -1,0 +1,63 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+djangorestframework = "<3.19,>=3.16"
+pyyaml = "*"
+django-cors-headers = "<5,>=4.7"
+pillow = "<14,>=13.0.0"
+pytest-django = "*"
+django-taggit = "<7,>=6.1"
+djangorestframework-simplejwt = "<6,>=5.5"
+psycopg = {extras = ["binary"], version = "<4,>=3.2"}
+markdown = "*"
+django = "<5.3,>=5.2.17"
+gunicorn = "<26,>=23"
+tox = "*"
+django-dotenv = "<2,>=1.4"
+faker = "*"
+nanoid = "<3,>=2"
+django-silk = "*"
+celery = "<6,>=5.4"
+sentry-sdk = "*"
+django-prometheus = "*"
+prometheus-client = "<1,>=0.22"
+opentelemetry-sdk = "<2,>=1.32"
+opentelemetry-exporter-otlp-proto-http = "<2,>=1.32"
+pytest = "*"
+kink = "*"
+django-storages = {extras = ["s3"], version = "<2,>=1.14.6"}
+boto3 = "==1.43.105"
+botocore = "==1.43.105"
+django-cleanup = "<10,>=9"
+django-elasticsearch-dsl = "*"
+elasticsearch = "<9,>=8.15"
+whitenoise = "<7,>=6.8"
+drf-spectacular = "<1,>=0.28"
+coverage = "*"
+drf-yasg = "*"
+django-redis = "<7,>=5.4"
+django-filter = "*"
+django-user-agents = "*"
+django-push-notifications = "*"
+firebase-admin = "<8,>=6.4"
+stripe = "<14,>=12.0"
+resend = "<3,>=2"
+djangorestframework-word-filter = "*"
+django-notifications-hq = "*"
+uvicorn = "*"
+django-phonenumber-field = {extras = ["phonenumbers"], version = "<9,>=8"}
+drf-access-policy = "*"
+argon2-cffi = "<26,>=25.1"
+kafka-python = "<3,>=2.0"
+requests = "<3,>=2.32"
+cryptography = "<51,>=50.0.2"
+redis = "<7,>=5"
+httpx = "<0.29,>=0.28"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
