@@ -1,0 +1,253 @@
+name: commerce-server
+services:
+  api:
+    restart: unless-stopped
+    init: true
+    healthcheck: &id001
+      test:
+      - CMD
+      - python
+      - -c
+      - from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/ready/',
+        timeout=5).read()
+      interval: 10s
+      timeout: 8s
+      retries: 12
+      start_period: 30s
+    image: ${API_IMAGE:?Load verified CI images before deployment}
+    group_add:
+    - '2000'
+    environment:
+      PROACE_CONFIG_MODE: vault
+      PROACE_CONFIG_FILE: /etc/proace/config.json
+      PROACE_SECRETS_FILE: /run/proace-vault/api/runtime.json
+      DJANGO_SETTINGS_MODULE: codematics.storefront_settings
+      GUNICORN_BIND: 0.0.0.0:8000
+      RUN_MIGRATIONS: 'false'
+      RUN_COLLECTSTATIC: 'false'
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
+    volumes:
+    - /etc/proace/config.json:/etc/proace/config.json:ro
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    - media-data:/app/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+  notification-worker:
+    restart: unless-stopped
+    init: true
+    command:
+    - celery
+    - -A
+    - codematics
+    - worker
+    - --loglevel=INFO
+    - --concurrency
+    - ${CELERY_WORKER_CONCURRENCY:-2}
+    healthcheck:
+      disable: true
+    image: ${API_IMAGE:?Load verified CI images before deployment}
+    group_add:
+    - '2000'
+    environment:
+      PROACE_CONFIG_MODE: vault
+      PROACE_CONFIG_FILE: /etc/proace/config.json
+      PROACE_SECRETS_FILE: /run/proace-vault/api/runtime.json
+      DJANGO_SETTINGS_MODULE: codematics.storefront_settings
+      GUNICORN_BIND: 0.0.0.0:8000
+      RUN_MIGRATIONS: 'false'
+      RUN_COLLECTSTATIC: 'false'
+      PROMETHEUS_MULTIPROC_DIR: ''
+    volumes:
+    - /etc/proace/config.json:/etc/proace/config.json:ro
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    - media-data:/app/media
+    depends_on:
+      api:
+        condition: service_healthy
+  media-worker:
+    restart: unless-stopped
+    init: true
+    command: ['python', 'manage.py', 'run_media_worker']
+    healthcheck:
+      disable: true
+    image: ${API_IMAGE:?Load verified CI images before deployment}
+    group_add:
+    - '2000'
+    environment:
+      PROACE_CONFIG_MODE: vault
+      PROACE_CONFIG_FILE: /etc/proace/config.json
+      PROACE_SECRETS_FILE: /run/proace-vault/api/runtime.json
+      DJANGO_SETTINGS_MODULE: codematics.storefront_settings
+      GUNICORN_BIND: 0.0.0.0:8000
+      RUN_MIGRATIONS: 'false'
+      RUN_COLLECTSTATIC: 'false'
+      PROMETHEUS_MULTIPROC_DIR: ''
+    volumes:
+    - /etc/proace/config.json:/etc/proace/config.json:ro
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    - media-data:/app/media
+    depends_on:
+      api:
+        condition: service_healthy
+    cpus: '${MEDIA_WORKER_CPUS:-1}'
+    mem_limit: '${MEDIA_WORKER_MEMORY:-768m}'
+
+  notification-stream:
+    restart: unless-stopped
+    init: true
+    healthcheck: *id001
+    image: ${STREAM_IMAGE:?Load verified CI images before deployment}
+    group_add:
+    - '2000'
+    environment:
+      PROACE_CONFIG_MODE: vault
+      PROACE_CONFIG_FILE: /etc/proace/config.json
+      PROACE_SECRETS_FILE: /run/proace-vault/api/runtime.json
+      DJANGO_SETTINGS_MODULE: codematics.stream_settings
+      GUNICORN_BIND: 0.0.0.0:8000
+      RUN_MIGRATIONS: 'false'
+      RUN_COLLECTSTATIC: 'false'
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
+    volumes:
+    - /etc/proace/config.json:/etc/proace/config.json:ro
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    - media-data:/app/media
+    depends_on:
+      api:
+        condition: service_healthy
+  celery-beat:
+    restart: unless-stopped
+    init: true
+    command:
+    - celery
+    - -A
+    - codematics
+    - beat
+    - --loglevel=INFO
+    healthcheck:
+      disable: true
+    image: ${API_IMAGE:?Load verified CI images before deployment}
+    group_add:
+    - '2000'
+    environment:
+      PROACE_CONFIG_MODE: vault
+      PROACE_CONFIG_FILE: /etc/proace/config.json
+      PROACE_SECRETS_FILE: /run/proace-vault/api/runtime.json
+      DJANGO_SETTINGS_MODULE: codematics.storefront_settings
+      GUNICORN_BIND: 0.0.0.0:8000
+      RUN_MIGRATIONS: 'false'
+      RUN_COLLECTSTATIC: 'false'
+      PROMETHEUS_MULTIPROC_DIR: ''
+    volumes:
+    - /etc/proace/config.json:/etc/proace/config.json:ro
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    - media-data:/app/media
+    depends_on:
+      api:
+        condition: service_healthy
+  postgres:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    restart: unless-stopped
+    group_add:
+    - '2000'
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Load public database name}
+      POSTGRES_USER: ${POSTGRES_USER:?Load public database user}
+      POSTGRES_PASSWORD_FILE: /run/proace-vault/api/postgres-password
+    volumes:
+    - postgres-data:/var/lib/postgresql/data
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    restart: unless-stopped
+    group_add:
+    - '2000'
+    command:
+    - redis-server
+    - /run/proace-vault/api/redis.conf
+    volumes:
+    - redis-data:/data
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    user: redis
+  minio:
+    image: cgr.dev/chainguard/minio:latest@sha256:2136d593beacf4461187035eca949fe49abd589d5079735025c711ca58fee0c8
+    restart: unless-stopped
+    group_add:
+    - '2000'
+    command:
+    - server
+    - /data
+    - --console-address
+    - :9001
+    environment:
+      MINIO_ROOT_USER_FILE: /run/proace-vault/api/minio-user
+      MINIO_ROOT_PASSWORD_FILE: /run/proace-vault/api/minio-password
+    volumes:
+    - minio-data:/data
+    - /run/proace-vault/api:/run/proace-vault/api:ro
+    ports:
+    - 127.0.0.1:9001:9001
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.5@sha256:8870d5b7b86235fa790c9112464f5fd3b693f89d73e757a630f8b5cda350f95b
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: 'false'
+      xpack.security.http.ssl.enabled: 'false'
+      ES_JAVA_OPTS: ${ELASTICSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
+    volumes:
+    - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl --silent --fail http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s
+        >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 18
+  nginx:
+    image: nginx:stable-alpine@sha256:970364228b1e4f932abc22d321932816782cca8a20b85a77552a7cfe9acfb3b5
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      notification-stream:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/health/live/ ||
+        exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    volumes:
+    - ../../server/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    - ../../server/nginx/upstream.docker.conf:/etc/nginx/upstream.conf:ro
+    - ../../server/nginx/stream-upstream.docker.conf:/etc/nginx/stream-upstream.conf:ro
+    - ../../server/nginx/blocked-ips.conf:/etc/nginx/blocked-ips.conf:ro
+    - ../../server/nginx/suspected-ips.conf:/etc/nginx/suspected-ips.conf:ro
+    - ../../server/nginx/trusted-proxies.conf:/etc/nginx/trusted-proxies.conf:ro
+    - ../../server/nginx/trusted-protocol-proxies.conf:/etc/nginx/trusted-protocol-proxies.conf:ro
+    - /etc/proace/allowed-ips.conf:/etc/nginx/allowed-ips.conf:ro
+volumes:
+  media-data: {}
+  postgres-data: {}
+  redis-data: {}
+  minio-data: {}
+  elasticsearch-data: {}
+networks:
+  default:
+    external: true
+    name: commerce-network

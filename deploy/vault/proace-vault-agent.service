@@ -1,0 +1,20 @@
+[Unit]
+Description=ProAce Vault Agent runtime secret rendering
+Requires=run-proace\x2dvault.mount
+After=network-online.target run-proace\x2dvault.mount
+Wants=network-online.target
+[Service]
+User=proace-vault
+Group=proace-api-secrets
+UMask=0027
+ExecStartPre=+/usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/proace-vault.conf
+ExecStart=/usr/local/bin/vault agent -config=/etc/proace/vault/agent.hcl
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/proace-vault /run/proace-bootstrap
+[Install]
+WantedBy=multi-user.target

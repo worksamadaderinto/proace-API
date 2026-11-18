@@ -1,0 +1,1 @@
+{{- with secret "kv/data/proace/production/api" -}}{{ .Data.data.MINIO_ROOT_USER }}{{- end -}}

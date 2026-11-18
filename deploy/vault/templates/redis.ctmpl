@@ -1,0 +1,5 @@
+appendonly yes
+save 60 1000
+bind 0.0.0.0
+protected-mode yes
+{{ with secret "kv/data/proace/production/api" }}requirepass {{ .Data.data.REDIS_PASSWORD | toJSON }}{{ end }}

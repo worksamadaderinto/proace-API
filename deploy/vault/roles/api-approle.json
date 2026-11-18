@@ -1,0 +1,10 @@
+{
+  "token_policies": [
+    "api-runtime"
+  ],
+  "token_period": "20m",
+  "token_num_uses": 0,
+  "secret_id_num_uses": 1,
+  "secret_id_ttl": "10m",
+  "token_no_default_policy": true
+}

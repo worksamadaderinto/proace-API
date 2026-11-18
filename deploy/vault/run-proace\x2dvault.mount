@@ -1,0 +1,10 @@
+[Unit]
+Description=Memory-only ProAce runtime secrets
+Before=docker.service proace-vault-agent.service
+[Mount]
+What=tmpfs
+Where=/run/proace-vault
+Type=tmpfs
+Options=mode=0711,uid=0,gid=0,size=16m,nosuid,nodev,noexec
+[Install]
+WantedBy=multi-user.target

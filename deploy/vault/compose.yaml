@@ -1,0 +1,14 @@
+name: proace-vault
+services:
+  vault:
+    image: hashicorp/vault:1.21.4@sha256:4e33b126a59c0c333b76fb4e894722462659a6bec7c48c9ee8cea56fccfd2569
+    command: server -config=/vault/config/server.hcl
+    restart: unless-stopped
+    cap_add: [IPC_LOCK]
+    ports: ['127.0.0.1:8200:8200']
+    volumes:
+      - ./server.hcl:/vault/config/server.hcl:ro
+      - /etc/proace/vault/tls:/vault/tls:ro
+      - vault-data:/vault/data
+volumes:
+  vault-data:

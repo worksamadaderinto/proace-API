@@ -1,0 +1,1 @@
+{{ with secret "kv/data/proace/production/api" }}{{ .Data.data | toJSON }}{{ end }}
