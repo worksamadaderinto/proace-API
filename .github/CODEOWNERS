@@ -1,0 +1,7 @@
+# Initial owner is the owner of the existing API origin, not an invented team.
+# Confirm this account has write access when creating the new sibling remotes.
+* @samadaderinto
+/.github/ @worksamadaderinto
+/scripts/ @worksamadaderinto
+/tools/ @worksamadaderinto
+/AGENTS.md @worksamadaderinto
